@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,7 @@ func main() {
 	router := mux.NewRouter()
 	router.HandleFunc("/init", func(w http.ResponseWriter, r *http.Request) { InitData(session, w, r) }).Methods("GET")
 	router.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) { Search(session, w, r) }).Methods("GET")
+	router.HandleFunc("/find/{id}", func(w http.ResponseWriter, r *http.Request) { FindById(session, w, r) }).Methods("GET")
 
 	// serve the app
 	fmt.Println("Server at 8000")
@@ -47,7 +49,7 @@ func getYCQLSession() *gocql.Session {
 
 	// compression algorithm (default: nil)
 	//cluster.Compressor = gocql.SnappyCompressor{}
-	// ^ causes errors in the log
+	// ^ causes errors in the log, does YB support compression?
 
 	// This uses the partition key "awareness" to route requests to the correct tserver host
 	// It falls back to a datacenter aware round-robin approach...
@@ -85,18 +87,20 @@ func InitData(session *gocql.Session, _response http.ResponseWriter, request *ht
 	log.Println("Vars:", vars)
 	log.Println("Params:", queryParams)
 
-	dataCount := 1_000 // default to 1000 rows
-	if v, found := queryParams["count"]; found {
-		dataCount, _ = strconv.Atoi(v[0])
+	dataRows := 10_000 // default to 10,000 rows
+	if v, exists := queryParams["rows"]; exists {
+		if count, err := strconv.Atoi(v[0]); err == nil {
+			dataRows = count
+		}
 	}
 
-	// set up the keyspace
+	// set up the demo keyspace
 	log.Println("Initializing 'demo' KEYSPACE...")
 	if err := session.Query("CREATE KEYSPACE IF NOT EXISTS demo").Exec(); err != nil {
 		log.Fatal(err)
 	}
 
-	// set up the table
+	// set up the demo table
 	log.Println("Initializing 'demo' TABLE...")
 	if err := session.Query(`CREATE TABLE
                                  IF NOT EXISTS demo.demo(
@@ -113,16 +117,16 @@ func InitData(session *gocql.Session, _response http.ResponseWriter, request *ht
 	}
 
 	// load initial data
-	log.Println("Initializing dataset with", dataCount, " x 2 rows...")
+	log.Println("Initializing dataset with", dataRows, "(x2) rows...")
 
-	for i := 0; i < dataCount; i++ {
+	for i := 0; i < dataRows; i++ {
 		for j := 0; j < 2; j++ {
 			if err := session.Query(`INSERT INTO demo.demo(
 										primaryId, secondaryId,
 										clusterCol1, clusterCol2,
 										dataCol1, dataCol2,	dataCol3)
 									       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				"P1", fmt.Sprintf("%013d", i), fmt.Sprintf("FOO%d", j), "BAR", rand.Intn(100), rand.Intn(2) == 1, time.Now()).Exec(); err != nil {
+				"P1", fmt.Sprintf("%013d", i), fmt.Sprintf("FOO%d", j), "BAR", rand.Intn(100), rand.Intn(2) == 1, time.Now().UTC()).Exec(); err != nil {
 				log.Fatal(err)
 			}
 		}
@@ -139,9 +143,11 @@ func Search(session *gocql.Session, response http.ResponseWriter, request *http.
 	log.Println("Vars:", vars)
 	log.Println("Params:", queryParams)
 
-	query := `SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
+	query := strings.Replace(
+		`SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
                 FROM demo.demo
-               WHERE primaryId = ? AND secondaryId IN(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+               WHERE primaryId = ? AND secondaryId IN(:ids)`,
+		":ids", strings.Repeat("?,", 9)+"?", -1)
 
 	params := []interface{}{"P1"}
 	// TODO make this dynamic on queryParams
@@ -168,12 +174,69 @@ func Search(session *gocql.Session, response http.ResponseWriter, request *http.
 		})
 	}
 
+	var jsonResponse JsonResponse
 	if err := iter.Close(); err != nil {
 		log.Println(err)
-		json.NewEncoder(response).Encode(JsonResponse{Type: "error", Message: err.Error()})
+		jsonResponse = JsonResponse{Type: "error", Message: err.Error()}
 	} else {
-		json.NewEncoder(response).Encode(JsonResponse{Type: "success", Data: resultData})
+		jsonResponse = JsonResponse{Type: "success", Data: resultData}
 	}
+
+	_ = json.NewEncoder(response).Encode(jsonResponse)
+}
+
+// FindById will return results that match the given PK
+func FindById(session *gocql.Session, response http.ResponseWriter, request *http.Request) {
+	vars := mux.Vars(request)
+	queryParams := request.URL.Query()
+
+	log.Println("Called FindById")
+	log.Println("Vars:", vars)
+	log.Println("Params:", queryParams)
+
+	primaryKeyLookup := "P1"
+	secondaryKeyLookup := "0000000000000"
+
+	if v, exists := vars["id"]; exists {
+		if s, err := strconv.Atoi(v); err == nil {
+			secondaryKeyLookup = fmt.Sprintf("%013d", s)
+		}
+	}
+
+	query := `SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
+                FROM demo.demo
+               WHERE primaryId = ? AND secondaryId = ?`
+
+	iter := session.Query(query, primaryKeyLookup, secondaryKeyLookup).Iter()
+
+	var resultData []ResultData
+	var secondaryId string
+	var clusterCol1 string
+	var clusterCol2 string
+	var dataCol1 int
+	var dataCol2 bool
+	var dataCol3 time.Time
+
+	for iter.Scan(&secondaryId, &clusterCol1, &clusterCol2, &dataCol1, &dataCol2, &dataCol3) {
+		resultData = append(resultData, ResultData{
+			SecondaryId: secondaryId,
+			ClusterCol1: clusterCol1,
+			ClusterCol2: clusterCol2,
+			DataCol1:    dataCol1,
+			DataCol2:    dataCol2,
+			DataCol3:    dataCol3,
+		})
+	}
+
+	var jsonResponse JsonResponse
+	if err := iter.Close(); err != nil {
+		log.Println(err)
+		jsonResponse = JsonResponse{Type: "error", Message: err.Error()}
+	} else {
+		jsonResponse = JsonResponse{Type: "success", Data: resultData}
+	}
+
+	_ = json.NewEncoder(response).Encode(jsonResponse)
 }
 
 type JsonResponse struct {
