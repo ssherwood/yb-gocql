@@ -25,7 +25,7 @@ func main() {
 	defer session.Close()
 
 	router := mux.NewRouter()
-	router.HandleFunc("/init", func(w http.ResponseWriter, r *http.Request) { InitData(session, w, r) }).Methods("GET")
+	router.HandleFunc("/init", func(w http.ResponseWriter, r *http.Request) { InitData(session, w, r) }).Methods("POST")
 	router.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) { Search(session, w, r) }).Methods("GET")
 	router.HandleFunc("/find/{id}", func(w http.ResponseWriter, r *http.Request) { FindById(session, w, r) }).Methods("GET")
 
@@ -38,14 +38,14 @@ func getYCQLSession() *gocql.Session {
 	cluster := gocql.NewCluster("127.0.0.1") //, "127.0.0.2", "127.0.0.3")
 	cluster.Port = 9042
 	cluster.ProtoVersion = 4
-	//cluster.DisableSkipMetadata = false // TODO why did we change the defaults?
-	// TODO is this CQLVersion correct?
-	cluster.CQLVersion = "3.4.2"               // CQL version (default: 3.0.0)
-	cluster.ConnectTimeout = 12 * time.Second  // initial connection timeout, used during initial dial to server (default: 600ms)
-	cluster.SocketKeepalive = 10 * time.Second // The keepalive period to use, enabled if > 0 (default: 0)
-	cluster.Timeout = 12 * time.Second         // connection timeout (default: 600ms)
-	cluster.Consistency = gocql.Quorum         // default consistency level (default: Quorum); "One" enables follow reads
+	cluster.CQLVersion = "3.4.2"              // CQL version (default: 3.0.0) // TODO is this CQLVersion correct?
+	cluster.ConnectTimeout = 12 * time.Second // initial connection timeout, used during initial dial to server (default: 600ms)
+	//cluster.SocketKeepalive = 10 * time.Second // The keepalive period to use, enabled if > 0 (default: 0)
+	cluster.Timeout = 12 * time.Second // connection timeout (default: 600ms)
+	cluster.Consistency = gocql.Quorum // default consistency level (default: Quorum); "One" enables follow reads
 	//cluster.Keyspace = "default" <- causes a segv on tserver
+
+	//cluster.DisableSkipMetadata = true 	   // TODO why did we change the defaults? https://github.com/yugabyte/yugabyte-db/issues/1312
 
 	// compression algorithm (default: nil)
 	//cluster.Compressor = gocql.SnappyCompressor{}
