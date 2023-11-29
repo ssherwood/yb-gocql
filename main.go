@@ -14,14 +14,12 @@ import (
 	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
 func main() {
 	log.Println("Starting...")
+	//pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
 
-	session := getYCQLSession()
+	defaultLogger := log.Default()
+	session := getYCQLSession(defaultLogger)
 	defer session.Close()
 
 	router := mux.NewRouter()
@@ -30,44 +28,59 @@ func main() {
 	router.HandleFunc("/find/{id}", func(w http.ResponseWriter, r *http.Request) { FindById(session, w, r) }).Methods("GET")
 
 	// serve the app
-	fmt.Println("Server at 8000")
+	log.Println("Server at 8000")
 	log.Fatal(http.ListenAndServe(":8000", router))
 }
 
-func getYCQLSession() *gocql.Session {
-	cluster := gocql.NewCluster("127.0.0.1") //, "127.0.0.2", "127.0.0.3")
-	cluster.Port = 9042
-	cluster.ProtoVersion = 4
-	cluster.CQLVersion = "3.4.2"              // CQL version (default: 3.0.0) // TODO is this CQLVersion correct?
-	cluster.ConnectTimeout = 12 * time.Second // initial connection timeout, used during initial dial to server (default: 600ms)
-	//cluster.SocketKeepalive = 10 * time.Second // The keepalive period to use, enabled if > 0 (default: 0)
-	cluster.Timeout = 12 * time.Second // connection timeout (default: 600ms)
-	cluster.Consistency = gocql.Quorum // default consistency level (default: Quorum); "One" enables follow reads
-	//cluster.Keyspace = "default" <- causes a segv on tserver
+func getYCQLSession(log *log.Logger) *gocql.Session {
+	contactPoints := strings.Split(strings.ReplaceAll(GetEnv("YCQL_CONTACT_POINTS", "127.0.0.1,127.0.0.2,127.0.0.3"), " ", ""), ",")
+	cluster := gocql.NewCluster(contactPoints...)
 
+	cluster.Logger = log // TODO how to do better logging?
+	cluster.Port = GetEnv("YCQL_PORT", 9042)
+	cluster.CQLVersion = GetEnv("YCQL_VERSION", "3.4.2")   // CQL version (default: 3.0.0)
+	cluster.ProtoVersion = GetEnv("YCQL_PROTO_VERSION", 4) // Native protocol version
+
+	// initial connection timeout, used during initial dial to server (default: 600ms)
+	cluster.ConnectTimeout = GetEnv[time.Duration]("YCQL_CONNECT_TIMEOUT", 3) * time.Second
+	// query timeout (default: 600ms)
+	cluster.Timeout = GetEnv[time.Duration]("YCQL_QUERY_TIMEOUT", 1500) * time.Millisecond
+	// The keepalive period to use, enabled if > 0 (default: 0) [default Dial default is 15s?]
+	cluster.SocketKeepalive = GetEnv[time.Duration]("YCQL_SOCKET_KEEPALIVE", 15) * time.Second
+	// default consistency level (default: Quorum); "One" enables follow reads
+	cluster.Consistency = gocql.ParseConsistency(GetEnv[string]("YCQL_CONSISTENCY", "LOCAL_ONE"))
+	// really no parse for SerialConsistency?
+	cluster.SerialConsistency = gocql.Serial
+
+	//cluster.Keyspace = "demo"
 	//cluster.DisableSkipMetadata = true 	   // TODO why did we change the defaults? https://github.com/yugabyte/yugabyte-db/issues/1312
 
 	// compression algorithm (default: nil)
 	//cluster.Compressor = gocql.SnappyCompressor{}
-	// ^ causes errors in the log, does YB support compression?
 
-	// This uses the partition key "awareness" to route requests to the correct tserver host
+	// This uses the partition awareness to route requests to the tablet leaders tserver
 	// It falls back to a datacenter aware round-robin approach...
-	// check pool->hostConnPools
-	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy("cloud1.datacenter1.rack1"))
-	//cluster.PoolConfig.HostSelectionPolicy = gocql.DCAwareRoundRobinPolicy("fooo")
+	cluster.PoolConfig.HostSelectionPolicy = gocql.YBPartitionAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	cluster.NumConns = 5 // number of connections per host (default 2)
+	// use a filter if you want to restrict connections to local DC nodes
+	//cluster.HostFilter = gocql.DataCentreHostFilter("us-east2")
 
 	// Retry policy: https://pkg.go.dev/github.com/gocql/gocql#hdr-Retries_and_speculative_execution
 	// BE CAREFUL WITH THIS...
 	// Retry on reads w/ an aggressive cluster.Timeout can lead to a request storm during leader elections...
-	//cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{
-	//	NumRetries: 5,
-	//	Min:        50 * time.Millisecond, // not sure how this works, it's not really documented?
-	//	Max:        2 * time.Second,
-	//}
+	cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{
+		NumRetries: 3,
+		Min:        50 * time.Millisecond, // not sure how this works, it's not really documented?
+		Max:        2 * time.Second,
+	}
 
 	// Default reconnection policy to use for reconnecting before trying to mark host as down (default: see below)
 	//cluster.ReconnectionPolicy
+
+	// TODO
+	//cluster.SslOpts = &gocql.SslOptions{
+	//	EnableHostVerification: true,
+	//}
 
 	session, err := cluster.CreateSession()
 	if err != nil {
@@ -75,7 +88,8 @@ func getYCQLSession() *gocql.Session {
 	}
 
 	// TODO, what is this supposed to show?
-	session.SetTrace(gocql.NewTraceWriter(session, os.Stdout))
+	session.SetTrace(gocql.NewTraceWriter(session, log.Writer()))
+
 	return session
 }
 
@@ -143,27 +157,43 @@ func Search(session *gocql.Session, response http.ResponseWriter, request *http.
 	log.Println("Vars:", vars)
 	log.Println("Params:", queryParams)
 
-	query := strings.Replace(
-		`SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
-                FROM demo.demo
-               WHERE primaryId = ? AND secondaryId IN(:ids)`,
-		":ids", strings.Repeat("?,", 9)+"?", -1)
+	//primaryKeysId, exists := queryParams["pk1"]
+	//if !exists {
+	//	// todo error
+	//}
 
-	params := []interface{}{"P1"}
+	//secondaryKeysId, exists := queryParams["pk2"]
+	//if !exists {
+	//	// todo error
+	//}
+
+	const query = //strings.Replace(
+	`SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
+                FROM demo.demo
+               WHERE primaryId = :primaryKeyId AND secondaryId IN :ids`
+	//":ids", strings.Repeat("?,", 9)+"?", -1)
+
+	// TODO not yet handling multiple PKs
+	ids := make([]string, 10)
+
 	// TODO make this dynamic on queryParams
 	for i := 0; i < 10; i++ {
-		params = append(params, fmt.Sprintf("%013d", rand.Intn(1000)))
+		//ids = append(ids, fmt.Sprintf("%013d", rand.Intn(10_000)))
+		ids[i] = fmt.Sprintf("%013d", rand.Intn(10_000))
 	}
 
-	iter := session.Query(query, params...).Iter()
+	primaryKey := "P1"
+	iter := session.Query(query, primaryKey, ids).Iter()
 
-	var resultData []ResultData
-	var secondaryId string
-	var clusterCol1 string
-	var clusterCol2 string
-	var dataCol1 int
-	var dataCol2 bool
-	var dataCol3 time.Time
+	var (
+		resultData  []ResultData
+		secondaryId string
+		clusterCol1 string
+		clusterCol2 string
+		dataCol1    int
+		dataCol2    bool
+		dataCol3    time.Time
+	)
 
 	for iter.Scan(&secondaryId, &clusterCol1, &clusterCol2, &dataCol1, &dataCol2, &dataCol3) {
 		resultData = append(resultData, ResultData{
@@ -203,19 +233,24 @@ func FindById(session *gocql.Session, response http.ResponseWriter, request *htt
 		}
 	}
 
+	// this is still not optimal:
+	// Range Scan on demo.demo
+	//   Key Conditions: (primaryid = 'P1') AND (secondaryid = '0000000000000')
 	query := `SELECT secondaryId, clusterCol1, clusterCol2, dataCol1, dataCol2, dataCol3
                 FROM demo.demo
-               WHERE primaryId = ? AND secondaryId = ?`
+               WHERE primaryId = :primaryKeyLookup AND secondaryId = :secondaryKeyLookup`
 
 	iter := session.Query(query, primaryKeyLookup, secondaryKeyLookup).Iter()
 
-	var resultData []ResultData
-	var secondaryId string
-	var clusterCol1 string
-	var clusterCol2 string
-	var dataCol1 int
-	var dataCol2 bool
-	var dataCol3 time.Time
+	var (
+		resultData  []ResultData
+		secondaryId string
+		clusterCol1 string
+		clusterCol2 string
+		dataCol1    int
+		dataCol2    bool
+		dataCol3    time.Time
+	)
 
 	for iter.Scan(&secondaryId, &clusterCol1, &clusterCol2, &dataCol1, &dataCol2, &dataCol3) {
 		resultData = append(resultData, ResultData{
@@ -237,6 +272,28 @@ func FindById(session *gocql.Session, response http.ResponseWriter, request *htt
 	}
 
 	_ = json.NewEncoder(response).Encode(jsonResponse)
+}
+
+// GetEnv
+// TODO move to a utility package
+func GetEnv[T any](env string, defaultValue T) T {
+	envValue, ok := os.LookupEnv(env)
+	if !ok {
+		return defaultValue
+	}
+
+	returnValue := defaultValue
+	switch p := any(&returnValue).(type) {
+	case *string:
+		*p = envValue
+	case *int:
+		*p, _ = strconv.Atoi(envValue)
+	case *time.Duration:
+		val, _ := strconv.Atoi(envValue)
+		*p = time.Duration(val)
+	}
+
+	return returnValue
 }
 
 type JsonResponse struct {
